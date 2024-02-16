@@ -1,0 +1,41 @@
+struct fs_input {
+  float4 position : SV_Position;
+  float3 color : COLOR0;
+};
+
+[outputtopology("triangle")][numthreads(1, 1, 1)] void
+mesh(out indices uint3     triangles[1],
+     out vertices fs_input vertices[3],
+     uint3                 tid
+     : SV_DispatchThreadID)
+{
+  SetMeshOutputCounts(3, 1);
+
+  static const float3 positions[3] = {
+    float3(0.0, 0.5, 0.0),
+    float3(0.5, -0.5, 0.0),
+    float3(-0.5, -0.5, 0.0),
+  };
+
+  static const float3 colors[3] = {
+    float3(1.0, 0.0, 0.0),
+    float3(0.0, 1.0, 0.0),
+    float3(0.0, 0.0, 1.0),
+  };
+
+  float4 offset = float4(0.0, 0.0, (float)tid, 0.0);
+
+  for (uint i = 0; i < 3; i++)
+  {
+    vertices[i].position = float4(positions[i], 1.0) + offset;
+    vertices[i].color = colors[i];
+  }
+
+  triangles[0] = uint3(0, 1, 2);
+}
+
+float4 fs(fs_input input)
+    : SV_Target
+{
+  return float4(input.color, 1.0);
+}

@@ -1,0 +1,85 @@
+static const float PI = 3.1415926535897932384626433832795;
+static const float SAMPLE_DELTA = 0.025;
+
+SamplerState             u_sampler : register(s0, space0);
+TextureCube<float4>      u_src : register(t0, space0);
+RWTexture2DArray<float4> u_dst : register(u0, space0);
+
+float3
+compute_irradiance(float3 n)
+{
+  float3 irradiance = 0.0;
+
+  float3 up = float3(0.0, 1.0, 0.0);
+  float3 right = cross(up, n);
+  up = cross(n, right);
+
+  float nr_samples = 0.0;
+
+  for (float phi = 0.0; phi < 2.0 * PI; phi += SAMPLE_DELTA)
+  {
+    for (float theta = 0.0; theta < 0.5 * PI; theta += SAMPLE_DELTA)
+    {
+      float3 tangent_sample =
+        float3(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta));
+
+      float3 sample_vec =
+        tangent_sample.x * right + tangent_sample.y * up + tangent_sample.z * n;
+
+      float4 sampled_value = u_src.SampleLevel(u_sampler, sample_vec, 0);
+
+      irradiance += float3(sampled_value.rgb * cos(theta) * sin(theta));
+      nr_samples++;
+    }
+  }
+
+  return PI * irradiance * (1.0 / float(nr_samples));
+}
+
+[numthreads(16, 16, 1)] void
+cs(uint3 id
+   : SV_DispatchThreadID)
+{
+  float3 thread_pos = float3(id);
+
+  float3 dim;
+  u_dst.GetDimensions(dim.x, dim.y, dim.z);
+
+  float2 texcoords = float2(
+    float(thread_pos.x + 0.5) / dim.x,
+    float(thread_pos.y + 0.5) / dim.y);
+
+  float3 sphere_dir = 1;
+
+  if (thread_pos.z <= 0)
+  {
+    sphere_dir =
+      normalize(float3(0.5, -(texcoords.y - 0.5), -(texcoords.x - 0.5)));
+  }
+  else if (thread_pos.z <= 1)
+  {
+    sphere_dir =
+      normalize(float3(-0.5, -(texcoords.y - 0.5), texcoords.x - 0.5));
+  }
+  else if (thread_pos.z <= 2)
+  {
+    sphere_dir = normalize(float3(texcoords.x - 0.5, 0.5, texcoords.y - 0.5));
+  }
+  else if (thread_pos.z <= 3)
+  {
+    sphere_dir =
+      normalize(float3(texcoords.x - 0.5, -0.5, -(texcoords.y - 0.5)));
+  }
+  else if (thread_pos.z <= 4)
+  {
+    sphere_dir =
+      normalize(float3(texcoords.x - 0.5, -(texcoords.y - 0.5), 0.5));
+  }
+  else if (thread_pos.z <= 5)
+  {
+    sphere_dir =
+      normalize(float3(-(texcoords.x - 0.5), -(texcoords.y - 0.5), -0.5));
+  }
+
+  u_dst[thread_pos.xyz] = float4(compute_irradiance(sphere_dir), 1.0);
+}

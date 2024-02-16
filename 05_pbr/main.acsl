@@ -1,0 +1,343 @@
+struct VSInput {
+  float3 position : POSITION;
+  float3 normal : NORMAL;
+  float2 uv0 : TEXCOORD0;
+  float2 uv1 : TEXCOORD1;
+  float4 joint : TEXCOORD2;
+  float4 weight : TEXCOORD3;
+  float4 color : COLOR;
+};
+
+struct FSInput {
+  float4 position : SV_Position;
+  float3 normal : NORMAL;
+  float4 color : COLOR;
+  float3 world_pos : TEXCOORD0;
+  float2 uv0 : TEXCOORD1;
+  float2 uv1 : TEXCOORD2;
+};
+
+struct Camera {
+  float4x4 projection;
+  float4x4 view;
+  float4x4 model;
+  float4   pos;
+};
+
+#define MAX_NUM_JOINTS 128
+
+struct UBONode {
+  float4x4 matrix;
+  float4x4 joint_matrix[MAX_NUM_JOINTS];
+  float    joint_count;
+};
+
+struct Material {
+  float4 base_color_factor;
+  float4 emissive_factor;
+  float4 diffuse_factor;
+  float4 specular_factor;
+  float  workflow;
+  int    base_color_index;
+  int    metallic_roughness_index;
+  int    normal_index;
+  int    occlusion_index;
+  int    emissive_index;
+  float  metallic_factor;
+  float  roughness_factor;
+  float  alpha_mask;
+  float  alpha_mask_cutoff;
+  float  emissive_strength;
+  float  pad;
+};
+
+struct PushData {
+  int material;
+  int matrices;
+};
+AC_PUSH_CONSTANT(PushData, pc);
+
+ConstantBuffer<Camera> g_cam : register(b0, space0);
+ByteAddressBuffer      g_nodes : register(t0, space1);
+SamplerState           g_sampler : register(s0, space2);
+ByteAddressBuffer      g_materials : register(t0, space2);
+TextureCube<float4>    g_irradiance : register(t1, space2);
+TextureCube<float4>    g_specular : register(t2, space2);
+Texture2D<float4>      g_brdf : register(t3, space2);
+Texture2D<float4>      g_textures[500] : register(t4, space2);
+
+FSInput
+vs(VSInput input)
+{
+  FSInput output;
+  output.color = input.color;
+
+  UBONode node = g_nodes.Load<UBONode>(pc.matrices * sizeof(UBONode));
+
+  float4 loc_pos;
+  if (node.joint_count > 0.0)
+  {
+    float4x4 skin_mat = input.weight.x * node.joint_matrix[int(input.joint.x)] +
+                        input.weight.y * node.joint_matrix[int(input.joint.y)] +
+                        input.weight.z * node.joint_matrix[int(input.joint.z)] +
+                        input.weight.w * node.joint_matrix[int(input.joint.w)];
+
+    loc_pos = mul(
+      g_cam.model,
+      mul(node.matrix, mul(skin_mat, float4(input.position, 1.0))));
+
+    float3x3 model = (float3x3)mul(g_cam.model, mul(node.matrix, skin_mat));
+
+    output.normal = normalize(mul(model, input.normal));
+  }
+  else
+  {
+    loc_pos = mul(g_cam.model, mul(node.matrix, float4(input.position, 1.0)));
+    float3x3 model = (float3x3)mul(g_cam.model, node.matrix);
+    output.normal = normalize(mul(model, input.normal));
+  }
+  output.world_pos = loc_pos.xyz / loc_pos.w;
+  output.uv0 = input.uv0;
+  output.uv1 = input.uv1;
+
+  output.position =
+    mul(g_cam.projection, mul(g_cam.view, float4(output.world_pos, 1.0)));
+
+  return output;
+}
+
+#define PI 3.1415926535897932384626433832795
+
+#define MAX_MESHES 40
+#define MAX_IMAGES 40
+#define ALPHA_MODE_MASK 1
+#define MIN_ROUGHNESS 0.04
+#define GAMMA 2.2
+#define EXPOSURE 4.5
+
+struct PBRInfo {
+  float  ndotl;
+  float  ndotv;
+  float  ndoth;
+  float  ldoth;
+  float  vdoth;
+  float  perceptual_roughness;
+  float  metalness;
+  float3 reflectance0;
+  float3 reflectance90;
+  float  alpha_roughness;
+  float3 diffuse_color;
+  float3 specular_color;
+};
+
+float3
+uncharted2tonemap(float3 color)
+{
+  float A = 0.15;
+  float B = 0.50;
+  float C = 0.10;
+  float D = 0.20;
+  float E = 0.02;
+  float F = 0.30;
+  return ((color * (A * color + C * B) + D * E) /
+          (color * (A * color + B) + D * F)) -
+         E / F;
+}
+
+float4
+tonemap(float4 color)
+{
+  float3 outcol = uncharted2tonemap(color.rgb * EXPOSURE);
+  outcol = outcol * (1.0f / uncharted2tonemap(11.2f));
+  return float4(outcol, color.a);
+}
+
+float3
+get_normal(Material mat, float2 tc, float3 normal, float3 world_pos)
+{
+  float3 tangent_normal =
+    g_textures[mat.normal_index].Sample(g_sampler, tc).rgb * 2.0 - 1.0;
+
+  float3 q1 = ddx(world_pos);
+  float3 q2 = ddy(world_pos);
+  float2 st1 = ddx(tc);
+  float2 st2 = ddy(tc);
+
+  float3   N = normalize(normal);
+  float3   T = normalize(q1 * st2.y - q2 * st1.y);
+  float3   B = -normalize(cross(N, T));
+  float3x3 TBN = float3x3(T, B, N);
+
+  return normalize(mul(tangent_normal, TBN));
+}
+
+float3
+get_ibl_contribution(PBRInfo info, float3 n, float3 reflection)
+{
+  const float PREFILTERED_MIP_LEVELS = 10;
+  float       lod = (info.perceptual_roughness * PREFILTERED_MIP_LEVELS);
+
+  float2 brdf_sample_point =
+    clamp(float2(info.ndotv, 1.0 - info.perceptual_roughness), 0.0, 1.0);
+  float3 brdf = g_brdf.Sample(g_sampler, brdf_sample_point).rgb;
+  float3 diffuse_light = tonemap(g_irradiance.Sample(g_sampler, n)).rgb;
+  float3 specular_light =
+    tonemap(g_specular.SampleLevel(g_sampler, reflection, lod)).rgb;
+
+  float3 diffuse = diffuse_light * info.diffuse_color;
+  float3 specular = specular_light * (info.specular_color * brdf.x + brdf.y);
+
+  return diffuse + specular;
+}
+
+float3
+diffuse(PBRInfo info)
+{
+  return info.diffuse_color / PI;
+}
+
+float3
+specular_reflection(PBRInfo info)
+{
+  return info.reflectance0 + (info.reflectance90 - info.reflectance0) *
+                               pow(clamp(1.0 - info.vdoth, 0.0, 1.0), 5.0);
+}
+
+float
+geometric_occlusion(PBRInfo info)
+{
+  float ndotl = info.ndotl;
+  float ndotv = info.ndotv;
+  float r = info.alpha_roughness;
+
+  float attenuation_l =
+    2.0 * ndotl / (ndotl + sqrt(r * r + (1.0 - r * r) * (ndotl * ndotl)));
+  float attenuation_v =
+    2.0 * ndotv / (ndotv + sqrt(r * r + (1.0 - r * r) * (ndotv * ndotv)));
+  return attenuation_l * attenuation_v;
+}
+
+float
+microfacet_distribution(PBRInfo info)
+{
+  float r2 = info.alpha_roughness * info.alpha_roughness;
+  float f = (info.ndoth * r2 - info.ndoth) * info.ndoth + 1.0;
+  return r2 / (PI * f * f);
+}
+
+float4
+fs(FSInput input)
+    : SV_Target
+{
+  Material mat = g_materials.Load<Material>(sizeof(Material) * pc.material);
+
+  float2 uv = input.uv0;
+
+  float4 base_color = mat.base_color_factor;
+
+  if (mat.base_color_index != -1)
+  {
+    base_color *= g_textures[mat.base_color_index].Sample(g_sampler, uv);
+  }
+
+  if (mat.alpha_mask == ALPHA_MODE_MASK)
+  {
+    if (base_color.a < mat.alpha_mask_cutoff)
+    {
+      discard;
+    }
+  }
+
+  float3 n;
+  if (mat.normal_index != -1)
+  {
+    n = get_normal(mat, uv, input.normal, input.world_pos);
+  }
+  else
+  {
+    n = normalize(input.normal);
+  }
+
+  float perceptual_roughness = mat.roughness_factor;
+  float metallic = mat.metallic_factor;
+  if (mat.metallic_roughness_index != -1)
+  {
+    float4 mr = g_textures[mat.metallic_roughness_index].Sample(g_sampler, uv);
+    perceptual_roughness *= mr.g;
+    metallic *= mr.b;
+  }
+
+  perceptual_roughness = clamp(perceptual_roughness, MIN_ROUGHNESS, 1.0);
+  metallic = clamp(metallic, 0.0, 1.0);
+
+  float ao = 1.0;
+  if (mat.occlusion_index != -1)
+  {
+    ao = g_textures[mat.occlusion_index].Sample(g_sampler, uv).r;
+  }
+
+  float3 emissive = mat.emissive_factor.rgb * mat.emissive_strength;
+  if (mat.emissive_index != -1)
+  {
+    emissive *= g_textures[mat.emissive_index].Sample(g_sampler, uv).rgb;
+  }
+
+  float3 f0 = 0.04;
+  float3 diffuse_color = base_color.rgb * (1.0 - f0);
+  diffuse_color *= (1.0 - metallic);
+
+  float alpha_roughness = perceptual_roughness * perceptual_roughness;
+
+  float3 specular_color = lerp(f0, base_color.rgb, metallic);
+
+  float reflectance =
+    max(max(specular_color.r, specular_color.g), specular_color.b);
+  float  reflectance90 = clamp(reflectance * 25.0, 0.0, 1.0);
+  float3 specular_environment_r0 = specular_color.rgb;
+  float3 specular_environment_r90 = reflectance90;
+
+  const float3 LIGHT_DIR = float3(0, 4, 4);
+
+  float3 v = normalize(g_cam.pos.xyz - input.world_pos);
+  float3 l = normalize(LIGHT_DIR.xyz);
+  float3 h = normalize(l + v);
+  float3 reflection = normalize(reflect(v, n));
+  reflection.y *= -1.0f;
+
+  float ndotl = clamp(dot(n, l), 0.001, 1.0);
+  float ndotv = clamp(abs(dot(n, v)), 0.001, 1.0);
+  float ndoth = clamp(dot(n, h), 0.0, 1.0);
+  float ldoth = clamp(dot(l, h), 0.0, 1.0);
+  float vdoth = clamp(dot(v, h), 0.0, 1.0);
+
+  PBRInfo info = {
+    ndotl,
+    ndotv,
+    ndoth,
+    ldoth,
+    vdoth,
+    perceptual_roughness,
+    metallic,
+    specular_environment_r0,
+    specular_environment_r90,
+    alpha_roughness,
+    diffuse_color,
+    specular_color,
+  };
+
+  float3 f = specular_reflection(info);
+  float3 g = geometric_occlusion(info);
+  float3 d = microfacet_distribution(info);
+
+  const float3 LIGHT_COLOR = 1.0;
+
+  float3 diffuse_contrib = (1.0 - f) * diffuse(info);
+  float3 spec_contrib = f * g * d / (4.0 * ndotl * ndotv);
+  float3 color = ndotl * LIGHT_COLOR * (diffuse_contrib + spec_contrib);
+  color += get_ibl_contribution(info, n, reflection);
+
+  color *= ao;
+  color += emissive;
+
+  return float4(color, base_color.a);
+}

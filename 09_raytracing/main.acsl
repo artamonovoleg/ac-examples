@@ -1,0 +1,56 @@
+RaytracingAccelerationStructure as : register(t0, space0);
+RWTexture2D<float4>             image : register(u0, space0);
+
+struct Camera {
+  float4x4 view_inverse;
+  float4x4 proj_inverse;
+};
+
+ConstantBuffer<Camera> g_cam : register(b0, space0);
+
+struct Payload
+{
+  float3 hit_value;
+};
+
+[shader("raygeneration")]
+void
+raygen()
+{
+  uint3 launch_id = DispatchRaysIndex();
+  uint3 launch_size = DispatchRaysDimensions();
+
+  float2 pixel_center = float2(launch_id.xy) + 0.5f;
+  float2 uv = pixel_center / float2(launch_size.xy);
+  float2 d = uv * 2.0f - 1.0f;
+
+  RayDesc ray_desc;
+  ray_desc.Origin = float3(0.0f, 0.0f, -1.0f);
+  ray_desc.Direction = normalize(float3(d.x, d.y, 1.0f));
+  ray_desc.TMin = 0.001;
+  ray_desc.TMax = 10000.0;
+
+  Payload payload;
+  TraceRay(as, RAY_FLAG_FORCE_OPAQUE, 0xff, 0, 0, 0, ray_desc, payload);
+
+  image[int2(launch_id.xy)] = float4(payload.hit_value, 0.0);
+}
+
+struct Attributes {
+  float2 bary;
+};
+
+[shader("closesthit")]
+void
+closest_hit(inout Payload p, in Attributes attrs)
+{
+  const float3 barycentric_coords =
+    float3(1.0f - attrs.bary.x - attrs.bary.y, attrs.bary.x, attrs.bary.y);
+  p.hit_value = pow(barycentric_coords, 1.0 / 2.2);
+}
+
+[shader("miss")]
+void miss(inout Payload p)
+{
+  p.hit_value = pow(float3(0.831, 0.878, 0.608), 1.0 / 2.2);
+}

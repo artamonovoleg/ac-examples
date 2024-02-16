@@ -1,0 +1,80 @@
+struct fs_input {
+  float4 position : SV_Position;
+  float3 color : COLOR;
+};
+
+fs_input
+vs(uint id
+   : SV_VertexID)
+{
+  static const float2 positions[3] = {
+    float2(0.0, 0.5),
+    float2(0.5, -0.5),
+    float2(-0.5, -0.5),
+  };
+
+  static const float3 colors[3] = {
+    float3(1.0, 0.0, 0.0),
+    float3(0.0, 1.0, 0.0),
+    float3(0.0, 0.0, 1.0),
+  };
+
+  fs_input output;
+  output.position = float4(positions[id], 0.0, 1.0);
+  output.color = colors[id];
+  return output;
+}
+
+#if (AC_PERMUTATION_ID == 0)
+float4
+fs(fs_input input)
+    : SV_Target
+{
+  return float4(input.color, 1.0);
+}
+#elif (AC_PERMUTATION_ID == 1)
+
+struct PushData {
+  float2 resolution;
+};
+AC_PUSH_CONSTANT(PushData, pc);
+
+RaytracingAccelerationStructure as : register(t0, space0);
+
+float4
+fs(fs_input input)
+    : SV_Target
+{
+  const float2 uv =
+    (float2(input.position.x, input.position.y) + 0.5f) / pc.resolution;
+  const float2 d = uv * 2.0f - 1.0f;
+
+  RayDesc ray;
+  ray.Origin = float3(0.0f, 0.0f, -1.0f);
+  ray.Direction = normalize(float3(d.x, d.y, 1.0f));
+  ray.TMin = 0.001;
+  ray.TMax = 10000.0;
+
+  RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
+
+  q.TraceRayInline(
+    as,
+    RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH,
+    0xff,
+    ray);
+
+  q.Proceed();
+
+  if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+  {
+    float2       bary = q.CommittedTriangleBarycentrics();
+    const float3 bc = float3(1.0f - bary.x - bary.y, bary.x, bary.y);
+
+    return float4(bc, 1.0);
+  }
+
+  return float4(0.831, 0.878, 0.608, 1.0);
+}
+#else
+#error "wrong permutation"
+#endif

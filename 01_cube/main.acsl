@@ -1,0 +1,29 @@
+struct fs_input {
+  float4 position : SV_Position;
+  float2 uv : TEXCOORD;
+};
+
+struct ShaderData {
+  float4x4 mvp;
+  float4   positions[12 * 3];
+  float4   uv[12 * 3];
+};
+
+ConstantBuffer<ShaderData> g_data : register(b0, space0);
+
+fs_input
+vs(uint id
+   : SV_VertexID)
+{
+  fs_input output;
+  output.position = mul(g_data.mvp, g_data.positions[id]);
+  output.uv = g_data.uv[id].xy;
+  return output;
+}
+
+float4
+fs(fs_input input)
+    : SV_Target
+{
+  return float4(input.uv, 0.0, 1.0);
+}

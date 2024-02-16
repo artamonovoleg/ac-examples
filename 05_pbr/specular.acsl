@@ -1,0 +1,162 @@
+#define IMPORTANCE_SAMPLE_COUNT 1024
+
+static const float PI = 3.1415926535897932384626433832795;
+static const int   SAMPLE_COUNT = IMPORTANCE_SAMPLE_COUNT;
+
+struct PCData {
+  uint  mip_size;
+  float roughness;
+};
+
+AC_PUSH_CONSTANT(PCData, pc);
+
+SamplerState             u_sampler : register(s0, space0);
+TextureCube<float4>      u_src : register(t0, space0);
+RWTexture2DArray<float4> u_dst : register(u0, space0);
+
+float
+distribution_ggx(float3 n, float3 h, float roughness)
+{
+  float a = roughness * roughness;
+  float a2 = a * a;
+  float ndoth = max(dot(n, h), 0.0);
+  float ndoth2 = ndoth * ndoth;
+
+  float nom = a2;
+  float denom = (ndoth2 * (a2 - 1.0) + 1.0);
+  denom = PI * denom * denom;
+
+  return nom / denom;
+}
+
+float
+radical_inverse_vdc(uint bits)
+{
+  bits = (bits << 16u) | (bits >> 16u);
+  bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+  bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+  bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+  bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+  return float(bits) * 2.3283064365386963e-10;
+}
+
+float2
+hammersley(uint i, uint n)
+{
+  return float2(float(i) / float(n), radical_inverse_vdc(i));
+}
+
+float3
+importance_sample_ggx(float2 xi, float3 n, float roughness)
+{
+  float a = roughness * roughness;
+
+  float phi = 2.0 * PI * xi.x;
+  float cos_theta = sqrt((1.0 - xi.y) / (1.0 + (a * a - 1.0) * xi.y));
+  float sin_theta = sqrt(1.0 - cos_theta * cos_theta);
+
+  float3 h;
+  h.x = cos(phi) * sin_theta;
+  h.y = sin(phi) * sin_theta;
+  h.z = cos_theta;
+
+  float3 up = abs(n.z) < 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
+  float3 tangent = normalize(cross(up, n));
+  float3 bitangent = cross(n, tangent);
+
+  float3 sample_vec = tangent * h.x + bitangent * h.y + n * h.z;
+  return normalize(sample_vec);
+}
+
+[numthreads(16, 16, 1)] void
+cs(uint3 id
+   : SV_DispatchThreadID)
+{
+  uint3 thread_pos = id;
+
+  float mip_roughness = pc.roughness;
+  uint  mip_size = pc.mip_size;
+
+  if (thread_pos.x >= mip_size || thread_pos.y >= mip_size)
+  {
+    return;
+  }
+
+  float2 texcoords = float2(
+    float(thread_pos.x + 0.5) / mip_size,
+    float(thread_pos.y + 0.5) / mip_size);
+
+  float3 sphere_dir = 1;
+
+  if (thread_pos.z <= 0)
+  {
+    sphere_dir =
+      normalize(float3(0.5, -(texcoords.y - 0.5), -(texcoords.x - 0.5)));
+  }
+  else if (thread_pos.z <= 1)
+  {
+    sphere_dir =
+      normalize(float3(-0.5, -(texcoords.y - 0.5), texcoords.x - 0.5));
+  }
+  else if (thread_pos.z <= 2)
+  {
+    sphere_dir = normalize(float3(texcoords.x - 0.5, 0.5, texcoords.y - 0.5));
+  }
+  else if (thread_pos.z <= 3)
+  {
+    sphere_dir =
+      normalize(float3(texcoords.x - 0.5, -0.5, -(texcoords.y - 0.5)));
+  }
+  else if (thread_pos.z <= 4)
+  {
+    sphere_dir =
+      normalize(float3(texcoords.x - 0.5, -(texcoords.y - 0.5), 0.5));
+  }
+  else if (thread_pos.z <= 5)
+  {
+    sphere_dir =
+      normalize(float3(-(texcoords.x - 0.5), -(texcoords.y - 0.5), -0.5));
+  }
+
+  float3 n = sphere_dir;
+  float3 r = n;
+  float3 v = r;
+
+  float  total_weight = 0.0;
+  float3 prefiltered_color = float3(0.0, 0.0, 0.0);
+
+  float2 dim;
+  u_src.GetDimensions(dim.x, dim.y);
+  float src_texture_size = max(dim[0], dim[1]);
+
+  for (int i = 0; i < SAMPLE_COUNT; ++i)
+  {
+    float2 xi = hammersley(i, SAMPLE_COUNT);
+    float3 h = importance_sample_ggx(xi, n, mip_roughness);
+    float3 l = normalize(2.0 * dot(v, h) * h - v);
+
+    float ndotl = max(dot(n, l), 0.0);
+    if (ndotl > 0.0)
+    {
+      float d = distribution_ggx(n, h, mip_roughness);
+      float ndoth = max(dot(n, h), 0.0);
+      float hdotv = max(dot(h, v), 0.0);
+      float pdf = d * ndoth / (4.0 * hdotv) + 0.0001;
+
+      float sa_texel = 4.0 * PI / (6.0 * src_texture_size * src_texture_size);
+      float sa_sample = 1.0 / (float(SAMPLE_COUNT) * pdf + 0.0001);
+
+      float mip_level = mip_roughness == 0.0
+                          ? 0.0
+                          : max(0.5 * log2(sa_sample / sa_texel) + 1.0f, 0.0f);
+
+      prefiltered_color +=
+        u_src.SampleLevel(u_sampler, l, mip_level).rgb * ndotl;
+
+      total_weight += ndotl;
+    }
+  }
+
+  prefiltered_color = prefiltered_color / total_weight;
+  u_dst[thread_pos.xyz] = float4(prefiltered_color, 1.0);
+}

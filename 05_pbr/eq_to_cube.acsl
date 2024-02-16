@@ -1,0 +1,69 @@
+struct PCData {
+  uint mip;
+  uint max_size;
+};
+
+AC_PUSH_CONSTANT(PCData, pc);
+SamplerState             u_sampler : register(s0, space0);
+Texture2D<float4>        u_src : register(t0, space0);
+RWTexture2DArray<float4> u_dst : register(u0, space0);
+
+[numthreads(16, 16, 1)] void
+cs(uint3 id
+   : SV_DispatchThreadID)
+{
+  float2 inv_atan = float2(0.1591f, 0.3183f);
+
+  float3 thread_pos = float3(id);
+
+  uint mip_level = pc.mip;
+
+  uint mip_size = pc.max_size >> mip_level;
+  if (thread_pos.x >= mip_size || thread_pos.y >= mip_size)
+  {
+    return;
+  }
+
+  float2 texcoords = float2(
+    float(thread_pos.x + 0.5) / mip_size,
+    1.0f - float(thread_pos.y + 0.5) / mip_size);
+  float3 sphere_dir = 1.0;
+  if (thread_pos.z <= 0)
+  {
+    sphere_dir =
+      normalize(float3(0.5, -(texcoords.y - 0.5), -(texcoords.x - 0.5)));
+  }
+  else if (thread_pos.z <= 1)
+  {
+    sphere_dir =
+      normalize(float3(-0.5, -(texcoords.y - 0.5), texcoords.x - 0.5));
+  }
+  else if (thread_pos.z <= 2)
+  {
+    sphere_dir =
+      normalize(float3(texcoords.x - 0.5, -0.5, -(texcoords.y - 0.5)));
+  }
+  else if (thread_pos.z <= 3)
+  {
+    sphere_dir = normalize(float3(texcoords.x - 0.5, 0.5, texcoords.y - 0.5));
+  }
+  else if (thread_pos.z <= 4)
+  {
+    sphere_dir =
+      normalize(float3(texcoords.x - 0.5, -(texcoords.y - 0.5), 0.5));
+  }
+  else if (thread_pos.z <= 5)
+  {
+    sphere_dir =
+      normalize(float3(-(texcoords.x - 0.5), -(texcoords.y - 0.5), -0.5));
+  }
+
+  float2 pano_uvs =
+    float2(atan2(sphere_dir.z, sphere_dir.x), asin(sphere_dir.y));
+  pano_uvs *= inv_atan;
+  pano_uvs += 0.5f;
+
+  float3 color = u_src.SampleLevel(u_sampler, pano_uvs, float(mip_level)).rgb;
+
+  u_dst[int3(thread_pos.xyz)] = float4(color, 1.0);
+}

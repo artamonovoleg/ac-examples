@@ -1,0 +1,125 @@
+struct VSInput {
+  float3 position : POSITION;
+  float3 normal : NORMAL;
+  float3 color : COLOR;
+};
+
+struct FSInput {
+  float4 position : SV_Position;
+  float3 normal : NORMAL;
+  float3 color : COLOR;
+  float3 view_vec : TEXCOORD0;
+  float3 light_vec : TEXCOORD1;
+  float4 shadow_coord : TEXCOORD2;
+};
+
+struct UBO {
+  float4x4 projection;
+  float4x4 view;
+  float4x4 light_space;
+  float4x4 transforms[4];
+  float4   light_pos;
+  float4   view_pos;
+};
+
+struct PushConst {
+  uint mat_index;
+};
+
+AC_PUSH_CONSTANT(PushConst, pc);
+
+ConstantBuffer<UBO> g_ubo : register(b0, space0);
+SamplerState        g_sampler : register(s0, space1);
+Texture2D<float>    g_shadow_map : register(t0, space1);
+
+FSInput
+vs(VSInput input)
+{
+  // clang-format off
+  static const float4x4 bias_mat = float4x4(
+    0.5, 0.0, 0.0, 0.5,
+    0.0, 0.5, 0.0, 0.5,
+    0.0, 0.0, 1.0, 0.0,
+    0.0, 0.0, 0.0, 1.0
+  );
+  // clang-format on
+
+  float4x4 transform = g_ubo.transforms[pc.mat_index];
+
+  FSInput output;
+
+  output.color = input.color;
+  output.normal = input.normal;
+
+  output.position = mul(
+    g_ubo.projection,
+    mul(g_ubo.view, mul(transform, float4(input.position, 1.0))));
+
+  float4 pos = mul(transform, float4(input.position, 1.0));
+  output.normal = mul((float3x3)transform, input.normal);
+  output.light_vec = normalize(g_ubo.light_pos.xyz - input.position);
+  output.view_vec = -pos.xyz;
+
+  output.shadow_coord = mul(
+    bias_mat,
+    mul(g_ubo.light_space, mul(transform, float4(input.position, 1.0))));
+
+  return output;
+}
+
+#define AMBIENT 0.1
+
+float
+texture_proj(float4 shadow_coord, float2 off)
+{
+  float shadow = 1.0;
+  if (shadow_coord.z > -1.0 && shadow_coord.z < 1.0)
+  {
+    float dist = g_shadow_map.Sample(g_sampler, shadow_coord.xy + off).r;
+    if (shadow_coord.w > 0.0 && dist < shadow_coord.z)
+    {
+      shadow = AMBIENT;
+    }
+  }
+
+  return shadow;
+}
+
+float
+filter_pcf(float4 sc)
+{
+  int2 texDim;
+  g_shadow_map.GetDimensions(texDim.x, texDim.y);
+  float scale = 1.5;
+  float dx = scale * 1.0 / float(texDim.x);
+  float dy = scale * 1.0 / float(texDim.y);
+
+  float shadowFactor = 0.0;
+  int   count = 0;
+  int   range = 1;
+
+  for (int x = -range; x <= range; x++)
+  {
+    for (int y = -range; y <= range; y++)
+    {
+      shadowFactor += texture_proj(sc, float2(dx * x, dy * y));
+      count++;
+    }
+  }
+  return shadowFactor / count;
+}
+
+float4
+fs(FSInput input)
+    : SV_Target
+{
+  float shadow = filter_pcf((input.shadow_coord / input.shadow_coord.w));
+
+  float3 N = normalize(input.normal);
+  float3 L = normalize(input.light_vec);
+  float3 V = normalize(input.view_vec);
+  float3 R = normalize(-reflect(L, N));
+  float3 diffuse = max(dot(N, L), AMBIENT) * input.color;
+
+  return float4(diffuse * shadow, 1.0);
+}

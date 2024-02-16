@@ -1,0 +1,34 @@
+struct vs_input {
+  float3 position : POSITION;
+  float2 uv : TEXCOORD;
+};
+
+struct fs_input {
+  float4 position : SV_Position;
+  float2 uv : TEXCOORD;
+};
+
+struct ShaderData {
+  float4x4 mvp;
+};
+
+ConstantBuffer<ShaderData> g_data : register(b0, space0);
+
+SamplerState      g_sampler : register(s0, space1);
+Texture2D<float4> g_image : register(t0, space1);
+
+fs_input
+vs(vs_input input)
+{
+  fs_input output;
+  output.position = mul(g_data.mvp, float4(input.position, 1.0));
+  output.uv = input.uv;
+  return output;
+}
+
+float4
+fs(fs_input input)
+    : SV_Target
+{
+  return float4(g_image.Sample(g_sampler, input.uv).rgb, 1.0);
+}
